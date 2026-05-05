@@ -16,6 +16,10 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL", "http://localhost:5000")
 DATA_FILE = "stocks.json"
 
+# Clean up URL trailing slashes just in case
+if EXTERNAL_URL.endswith('/'):
+    EXTERNAL_URL = EXTERNAL_URL[:-1]
+
 # --- Data Management ---
 def load_data():
     if os.path.exists(DATA_FILE):
@@ -48,7 +52,6 @@ def fetch_stock_details(ticker):
         except:
             return str(val)
 
-    # Get fast current price
     try:
         current_price = stock.fast_info['last_price']
     except:
@@ -61,7 +64,7 @@ def fetch_stock_details(ticker):
         "current_price": round(current_price, 2) if isinstance(current_price, (int, float)) else current_price,
         "market_cap": safe_get('marketCap', 'large'),
         "pe": safe_get('trailingPE'),
-        "industry_pe": "N/A",  # yfinance does not reliably provide Industry P/E
+        "industry_pe": "N/A",  
         "pb": safe_get('priceToBook'),
         "debt_to_equity": safe_get('debtToEquity'),
         "revenue_growth": safe_get('revenueGrowth', 'percent'),
@@ -69,31 +72,46 @@ def fetch_stock_details(ticker):
     }
     return current_price, details
 
-# --- Alert Senders ---
+# --- Alert Senders (UPDATED FOR HTML AND LOGGING) ---
 def send_telegram_alert(ticker, price, limit, is_immediate=False):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        print("⚠️ ERROR: Telegram credentials are missing in Environment Variables!")
         return
     
     continue_url = f"{EXTERNAL_URL}/alert_action/{ticker}/continue"
     remove_url = f"{EXTERNAL_URL}/alert_action/{ticker}/remove"
     
+    # Using HTML to prevent Markdown V1/V2 parsing crashes
     if is_immediate:
-        header = f"⚡ *INSTANT ALERT: {ticker}*"
+        header = f"⚡ <b>INSTANT ALERT: {ticker}</b>"
         body = f"You just added this stock and it is ALREADY below your limit!\nLimit: ₹{limit}\nCurrent Price: ₹{price:.2f}"
     else:
-        header = f"🚨 *STOCK ALERT: {ticker}*"
+        header = f"🚨 <b>STOCK ALERT: {ticker}</b>"
         body = f"Price has dropped below ₹{limit}!\nCurrent Price: ₹{price:.2f}"
 
     message = (
         f"{header}\n{body}\n\n"
         f"Choose an action:\n"
-        f"✅ [Continue Monitoring]({continue_url})\n"
-        f"❌ [Remove Alert]({remove_url})"
+        f"✅ <a href='{continue_url}'>Continue Monitoring</a>\n"
+        f"❌ <a href='{remove_url}'>Remove Alert</a>"
     )
     
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "Markdown", "disable_web_page_preview": True}
-    requests.post(url, json=payload)
+    payload = {
+        "chat_id": TELEGRAM_CHAT_ID, 
+        "text": message, 
+        "parse_mode": "HTML", 
+        "disable_web_page_preview": True
+    }
+    
+    try:
+        # Added detailed logging so we can see exactly what Telegram says
+        response = requests.post(url, json=payload)
+        print(f"--- TELEGRAM API RESPONSE FOR {ticker} ---")
+        print(response.text)
+        print("------------------------------------------")
+    except Exception as e:
+        print(f"Failed to connect to Telegram: {e}")
 
 # --- Background Price Checker ---
 def price_checker():
@@ -106,11 +124,9 @@ def price_checker():
                 stock = yf.Ticker(ticker)
                 current_price = stock.fast_info['last_price']
                 
-                # Make sure details dict exists
                 if 'details' not in info:
                     info['details'] = {}
                 
-                # Update real-time price quietly so dashboard is always fresh
                 if info['details'].get('current_price') != round(current_price, 2):
                     info['details']['current_price'] = round(current_price, 2)
                     updated = True
@@ -118,19 +134,17 @@ def price_checker():
                 limit = info['limit']
                 state = info.get('state', 'UNKNOWN')
                 
-                # Logic: Arm the alert if it goes above
                 if current_price > limit and state != "ABOVE":
                     info['state'] = "ABOVE"
                     updated = True
                     
-                # Logic: Trigger alert if it drops back down
                 elif current_price <= limit and state == "ABOVE":
                     info['state'] = "ALERTED" 
                     updated = True
                     send_telegram_alert(ticker, current_price, limit, is_immediate=False)
                     
             except Exception as e:
-                print(f"Error checking {ticker}: {e}")
+                pass
                 
         if updated:
             save_data(data)
@@ -243,21 +257,18 @@ def add_stock():
     limit = float(request.form['limit'])
     data = load_data()
     
-    # 1. Fetch live data
     try:
         current_price, details = fetch_stock_details(ticker)
     except:
         current_price = 0.0
         details = {}
     
-    # 2. Instant Check Logic
     if current_price and current_price <= limit:
         state = "ALERTED"
         send_telegram_alert(ticker, current_price, limit, is_immediate=True)
     else:
         state = "ABOVE"
         
-    # 3. Save
     data[ticker] = {
         "limit": limit, 
         "state": state,
@@ -271,5 +282,27 @@ def remove_stock(ticker):
     data = load_data()
     if ticker in data:
         del data[ticker]
-        save
+        save_data(data)
+    return redirect(url_for('index'))
+
+@app.route('/alert_action/<ticker>/<action>')
+def alert_action(ticker, action):
+    data = load_data()
+    if ticker not in data:
+        return "Ticker not found or already removed.", 404
         
+    if action == "remove":
+        del data[ticker]
+        save_data(data)
+        return f"<h3>✅ Alert for {ticker} permanently removed.</h3><br><a href='/'>Back to Dashboard</a>"
+        
+    elif action == "continue":
+        data[ticker]['state'] = "ALERTED"
+        save_data(data)
+        return f"<h3>✅ Monitoring continued for {ticker}.</h3><p>You will be alerted again only after the price goes above ₹{data[ticker]['limit']} and drops back down.</p><br><a href='/'>Back to Dashboard</a>"
+
+    return "Invalid Action", 400
+
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', port=int(os.environ.get("PORT", 5000)))
+    
