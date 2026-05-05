@@ -4,6 +4,7 @@ import time
 import threading
 import yfinance as yf
 import requests
+from bs4 import BeautifulSoup
 from flask import Flask, request, redirect, url_for, render_template_string
 from dotenv import load_dotenv
 
@@ -16,7 +17,6 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL", "http://localhost:5000")
 DATA_FILE = "stocks.json"
 
-# Clean up URL trailing slashes just in case
 if EXTERNAL_URL.endswith('/'):
     EXTERNAL_URL = EXTERNAL_URL[:-1]
 
@@ -31,18 +31,58 @@ def save_data(data):
     with open(DATA_FILE, "w") as f:
         json.dump(data, f, indent=4)
 
+# --- BULLETPROOF PRICE MATCHER ---
+def get_live_price(ticker):
+    """Tries Yahoo first, falls back to Google Finance if Yahoo blocks Render's IP"""
+    # 1. Try Yahoo Finance
+    try:
+        stock = yf.Ticker(ticker)
+        price = float(stock.fast_info['last_price'])
+        if price > 0: return price
+    except:
+        pass
+
+    # 2. Fallback to Google Finance
+    try:
+        # Convert Yahoo format (TCS.NS) to Google format (TCS:NSE)
+        if ticker.endswith('.NS'):
+            g_ticker = f"{ticker[:-3]}:NSE"
+        elif ticker.endswith('.BO'):
+            g_ticker = f"{ticker[:-3]}:BOM"
+        else:
+            g_ticker = ticker
+            
+        url = f"https://www.google.com/finance/quote/{g_ticker}"
+        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"}
+        response = requests.get(url, headers=headers, timeout=5)
+        soup = BeautifulSoup(response.text, 'html.parser')
+        
+        # Google Finance CSS class for the main price
+        price_div = soup.find("div", class_="YMlKec fxKbKc")
+        if price_div:
+            price_str = price_div.text.replace('₹', '').replace(',', '').replace('$', '').strip()
+            return float(price_str)
+    except Exception as e:
+        print(f"Google fallback failed for {ticker}: {e}")
+        
+    return 0.0
+
 # --- Fetch Stock Fundamentals ---
 def fetch_stock_details(ticker):
-    stock = yf.Ticker(ticker)
-    info = stock.info
+    current_price = get_live_price(ticker)
+    
+    # Try to get fundamentals from Yahoo (might still return N/A if blocked, but price will work)
+    try:
+        stock = yf.Ticker(ticker)
+        info = stock.info
+    except:
+        info = {}
     
     def safe_get(key, format_type=None):
         val = info.get(key)
-        if val is None:
-            return "N/A"
+        if val is None: return "N/A"
         try:
-            if format_type == "percent":
-                return f"{val * 100:.2f}%"
+            if format_type == "percent": return f"{val * 100:.2f}%"
             if format_type == "large":
                 if val >= 1e12: return f"{val/1e12:.2f}T"
                 elif val >= 1e9: return f"{val/1e9:.2f}B"
@@ -52,16 +92,8 @@ def fetch_stock_details(ticker):
         except:
             return str(val)
 
-    try:
-        current_price = stock.fast_info['last_price']
-    except:
-        current_price = safe_get('currentPrice')
-        
-    if current_price == "N/A" or current_price is None:
-        current_price = 0.0
-
     details = {
-        "current_price": round(current_price, 2) if isinstance(current_price, (int, float)) else current_price,
+        "current_price": current_price,
         "market_cap": safe_get('marketCap', 'large'),
         "pe": safe_get('trailingPE'),
         "industry_pe": "N/A",  
@@ -72,16 +104,15 @@ def fetch_stock_details(ticker):
     }
     return current_price, details
 
-# --- Alert Senders (UPDATED FOR HTML AND LOGGING) ---
+# --- Alert Senders ---
 def send_telegram_alert(ticker, price, limit, is_immediate=False):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        print("⚠️ ERROR: Telegram credentials are missing in Environment Variables!")
+        print("⚠️ ERROR: Telegram credentials are missing!")
         return
     
     continue_url = f"{EXTERNAL_URL}/alert_action/{ticker}/continue"
     remove_url = f"{EXTERNAL_URL}/alert_action/{ticker}/remove"
     
-    # Using HTML to prevent Markdown V1/V2 parsing crashes
     if is_immediate:
         header = f"⚡ <b>INSTANT ALERT: {ticker}</b>"
         body = f"You just added this stock and it is ALREADY below your limit!\nLimit: ₹{limit}\nCurrent Price: ₹{price:.2f}"
@@ -103,15 +134,7 @@ def send_telegram_alert(ticker, price, limit, is_immediate=False):
         "parse_mode": "HTML", 
         "disable_web_page_preview": True
     }
-    
-    try:
-        # Added detailed logging so we can see exactly what Telegram says
-        response = requests.post(url, json=payload)
-        print(f"--- TELEGRAM API RESPONSE FOR {ticker} ---")
-        print(response.text)
-        print("------------------------------------------")
-    except Exception as e:
-        print(f"Failed to connect to Telegram: {e}")
+    requests.post(url, json=payload)
 
 # --- Background Price Checker ---
 def price_checker():
@@ -121,28 +144,29 @@ def price_checker():
         
         for ticker, info in list(data.items()):
             try:
-                stock = yf.Ticker(ticker)
-                current_price = stock.fast_info['last_price']
+                current_price = get_live_price(ticker)
                 
-                if 'details' not in info:
-                    info['details'] = {}
-                
-                if info['details'].get('current_price') != round(current_price, 2):
-                    info['details']['current_price'] = round(current_price, 2)
-                    updated = True
+                # Only process if we actually got a real price
+                if current_price > 0:
+                    if 'details' not in info:
+                        info['details'] = {}
+                    
+                    if info['details'].get('current_price') != current_price:
+                        info['details']['current_price'] = current_price
+                        updated = True
 
-                limit = info['limit']
-                state = info.get('state', 'UNKNOWN')
-                
-                if current_price > limit and state != "ABOVE":
-                    info['state'] = "ABOVE"
-                    updated = True
+                    limit = info['limit']
+                    state = info.get('state', 'UNKNOWN')
                     
-                elif current_price <= limit and state == "ABOVE":
-                    info['state'] = "ALERTED" 
-                    updated = True
-                    send_telegram_alert(ticker, current_price, limit, is_immediate=False)
-                    
+                    if current_price > limit and state != "ABOVE":
+                        info['state'] = "ABOVE"
+                        updated = True
+                        
+                    elif current_price <= limit and state == "ABOVE":
+                        info['state'] = "ALERTED" 
+                        updated = True
+                        send_telegram_alert(ticker, current_price, limit, is_immediate=False)
+                        
             except Exception as e:
                 pass
                 
@@ -200,7 +224,7 @@ HTML_TEMPLATE = """
                     <tr>
                         <td class="ps-3">
                             <strong>{{ ticker }}</strong><br>
-                            <small class="text-muted">Live: ₹{{ info.details.current_price if info.details else 'N/A' }}</small>
+                            <small class="text-muted">Live: ₹{{ info.details.current_price if info.details and info.details.current_price > 0 else 'N/A' }}</small>
                         </td>
                         <td class="align-middle">₹{{ info.limit }}</td>
                         <td class="align-middle">
@@ -257,13 +281,11 @@ def add_stock():
     limit = float(request.form['limit'])
     data = load_data()
     
-    try:
-        current_price, details = fetch_stock_details(ticker)
-    except:
-        current_price = 0.0
-        details = {}
+    # 1. Fetch live price with Google Fallback included
+    current_price, details = fetch_stock_details(ticker)
     
-    if current_price and current_price <= limit:
+    # 2. Check logic and alert!
+    if current_price > 0 and current_price <= limit:
         state = "ALERTED"
         send_telegram_alert(ticker, current_price, limit, is_immediate=True)
     else:
@@ -289,20 +311,20 @@ def remove_stock(ticker):
 def alert_action(ticker, action):
     data = load_data()
     if ticker not in data:
-        return "Ticker not found or already removed.", 404
+        return "Ticker not found.", 404
         
     if action == "remove":
         del data[ticker]
         save_data(data)
-        return f"<h3>✅ Alert for {ticker} permanently removed.</h3><br><a href='/'>Back to Dashboard</a>"
+        return f"<h3>✅ Alert removed.</h3><br><a href='/'>Back to Dashboard</a>"
         
     elif action == "continue":
         data[ticker]['state'] = "ALERTED"
         save_data(data)
-        return f"<h3>✅ Monitoring continued for {ticker}.</h3><p>You will be alerted again only after the price goes above ₹{data[ticker]['limit']} and drops back down.</p><br><a href='/'>Back to Dashboard</a>"
+        return f"<h3>✅ Monitoring continued.</h3><br><a href='/'>Back to Dashboard</a>"
 
     return "Invalid Action", 400
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=int(os.environ.get("PORT", 5000)))
-    
+        
